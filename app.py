@@ -29,20 +29,17 @@ ELO_RATINGS = {}
 DEFAULT_SETS_LINE = 2.5
 ODDS_WORKERS = 8
 
-# ===== Filters =====
 MODEL_SUPPORT_MIN_PROB = 0.60
 AUTO_TRACK_MARKETS = ("mw", "sets")
 AUTO_TRACK_MIN_EDGE_MW = 0.03
 AUTO_TRACK_MIN_EDGE_SETS = 0.04
 
-# Top picks dashboard
 TOP_PICKS_MIN_ODDS = 1.50
 TOP_PICKS_LIMIT = 5
 TOP_PICKS_MIN_EDGE = 0.01
 
 AUTO_SETTLE_INTERVAL = 900
 
-# ===== Timezone =====
 NAIROBI_TZ = ZoneInfo("Africa/Nairobi")
 BERLIN_TZ = ZoneInfo("Europe/Berlin")
 
@@ -83,13 +80,10 @@ def load_all_odds():
     return {r["match_id"]: dict(r) for r in rows}
 
 
-def convert_te_time_to_nairobi(time_str):
+def convert_te_time_to_nairobi(time_str, match_date=None):
     """
     TennisExplorer shows times in Europe/Berlin (CET/CEST).
     Convert to Africa/Nairobi (EAT, GMT+3, no DST).
-
-    Uses zoneinfo so the offset automatically adjusts for European DST
-    (last Sunday of March → last Sunday of October).
     """
     if not time_str:
         return ""
@@ -99,9 +93,10 @@ def convert_te_time_to_nairobi(time_str):
 
     h, mn = int(m.group(1)), int(m.group(2))
 
-    # Anchor to today's date in Nairobi so we know which DST period applies
-    today_nairobi = datetime.now(NAIROBI_TZ).date()
-    naive = datetime(today_nairobi.year, today_nairobi.month, today_nairobi.day,
+    if match_date is None:
+        match_date = datetime.now(NAIROBI_TZ).date()
+
+    naive = datetime(match_date.year, match_date.month, match_date.day,
                      h, mn, tzinfo=BERLIN_TZ)
     nairobi_dt = naive.astimezone(NAIROBI_TZ)
     return nairobi_dt.strftime("%H:%M")
@@ -211,10 +206,16 @@ def predict(p1, p2, surface, form1=None, form2=None,
     }
 
 
-# =================== Load matches ===================
-def load_matches(ranked_only=True, force=False, fetch_odds=True):
+# =================== Load matches (now date-aware) ===================
+def load_matches(ranked_only=True, force=False, fetch_odds=True,
+                 target_date=None):
     global ELO_RATINGS
-    key = "ranked" if ranked_only else "all"
+    if target_date is None:
+        target_date = datetime.now(NAIROBI_TZ).date()
+
+    date_str = target_date.isoformat()
+    key = f"{date_str}_{'ranked' if ranked_only else 'all'}"
+
     if key in fixtures_cache and not force:
         return fixtures_cache[key]
 
@@ -229,7 +230,8 @@ def load_matches(ranked_only=True, force=False, fetch_odds=True):
     player_index = players.build_index()
     form_cache = scrapers.load_form()
 
-    raw = scrapers.get_todays_matches(ranked_only=ranked_only)
+    raw = scrapers.get_todays_matches(ranked_only=ranked_only,
+                                     target_date=target_date)
 
     odds_map = {}
     if fetch_odds:
@@ -293,7 +295,8 @@ def load_matches(ranked_only=True, force=False, fetch_odds=True):
             if sets_odds:
                 sets_hits += 1
 
-        display_time = convert_te_time_to_nairobi(m.get("status") or "")
+        display_time = convert_te_time_to_nairobi(
+            m.get("status") or "", match_date=target_date)
 
         out.append({
             "match": {
@@ -316,8 +319,8 @@ def load_matches(ranked_only=True, force=False, fetch_odds=True):
 
     out.sort(key=lambda m: (m["match"]["time"] == "", m["match"]["time"]))
 
-    print(f"[app] resolved IDs: {resolved_hits}/{len(out)} · "
-          f"Elo-weighted form: {form_resolved}/{len(out)} · "
+    print(f"[app] [{date_str}] resolved: {resolved_hits}/{len(out)} · "
+          f"form: {form_resolved}/{len(out)} · "
           f"MW odds: {odds_hits}/{len(out)} · Sets odds: {sets_hits}/{len(out)}")
 
     fixtures_cache[key] = out
@@ -526,11 +529,23 @@ PAGE = """
     background:linear-gradient(90deg,var(--p1),var(--p2));
     -webkit-background-clip:text;-webkit-text-fill-color:transparent}
   .sub{color:var(--dim);font-size:12.5px;margin-top:4px}
-  .toolbar{display:flex;gap:8px;margin:12px 0 8px}
-  .toolbar input{flex:1;background:rgba(255,255,255,0.05);
+
+  .toolbar{display:flex;gap:8px;margin:12px 0 8px;flex-wrap:wrap}
+  .toolbar input[type=text]{flex:1;min-width:200px;
+    background:rgba(255,255,255,0.05);
     border:1px solid var(--line);color:var(--fg);
     padding:9px 12px;border-radius:9px;font-size:13px;font-family:inherit}
-  .toolbar input:focus{outline:none;border-color:rgba(127,212,255,0.55);
+  .toolbar input[type=text]:focus{outline:none;
+    border-color:rgba(127,212,255,0.55);
+    background:rgba(127,212,255,0.06)}
+  .toolbar input[type=date]{
+    background:rgba(255,255,255,0.05);
+    border:1px solid var(--line);color:var(--fg);
+    padding:9px 12px;border-radius:9px;font-size:13px;font-family:inherit;
+    color-scheme:dark;
+  }
+  .toolbar input[type=date]:focus{outline:none;
+    border-color:rgba(127,212,255,0.55);
     background:rgba(127,212,255,0.06)}
   .toolbar a{background:rgba(255,255,255,0.05);border:1px solid var(--line);
     color:var(--dim2);padding:9px 14px;border-radius:9px;
@@ -538,6 +553,32 @@ PAGE = """
   .toolbar a:hover{border-color:rgba(127,212,255,0.4);color:var(--p1)}
   .toolbar a.primary{background:linear-gradient(90deg,var(--p1),var(--p2));
     color:#0a0d1a;font-weight:800;border-color:transparent}
+  .toolbar .today-btn{
+    background:rgba(110,231,183,0.12);border:1px solid rgba(110,231,183,0.35);
+    color:var(--hit);padding:9px 12px;border-radius:9px;
+    font-size:12px;font-weight:700;text-decoration:none;
+    display:flex;align-items:center;gap:4px;
+  }
+  .toolbar .today-btn:hover{background:rgba(110,231,183,0.18)}
+
+  .date-info{
+    font-size:11.5px;color:var(--dim);
+    margin-bottom:8px;display:flex;align-items:center;gap:8px;
+  }
+  .date-info .badge{
+    background:rgba(255,255,255,0.06);
+    padding:2px 8px;border-radius:6px;
+    color:var(--dim2);font-weight:600;
+    font-variant-numeric:tabular-nums;
+  }
+  .date-info .badge.today{
+    background:rgba(110,231,183,0.13);
+    color:var(--hit);
+  }
+  .date-info .badge.past{
+    background:rgba(167,139,250,0.13);
+    color:var(--dual);
+  }
 
   .view-toggle{
     display:flex;gap:0;margin-bottom:14px;
@@ -622,7 +663,7 @@ PAGE = """
   .top-tourney{
     font-size:10px;letter-spacing:1.2px;text-transform:uppercase;
     color:var(--top);font-weight:800;margin-bottom:6px;
-    display:flex;align-items:center;gap:8px;
+    display:flex;align-items:center;gap:8px;flex-wrap:wrap;
   }
   .top-card.sets .top-tourney{color:var(--sets)}
   .top-tourney .mkt-badge{
@@ -672,6 +713,9 @@ PAGE = """
     color:var(--dim2);font-size:13px;line-height:1.7;
   }
   .top-empty b{color:var(--fg)}
+
+  .cards-grid{display:block}
+  .top-picks-grid{display:block}
 
   .card{background:linear-gradient(180deg,rgba(255,255,255,0.045),rgba(255,255,255,0.012));
     border:1px solid var(--line);border-radius:16px;margin-bottom:12px;overflow:hidden}
@@ -786,25 +830,78 @@ PAGE = """
     border-radius:14px;padding:22px;text-align:center;color:var(--dim2);
     font-size:13px;line-height:1.6}
   a{color:var(--p1)}
+
+  /* ============ DESKTOP ============ */
+  @media (min-width: 900px) {
+    body { padding: 32px 24px 80px; }
+    .wrap { max-width: 1280px; }
+
+    .toolbar, .view-toggle, .filter-bar, .date-info, .top-header {
+      max-width: 900px;
+    }
+
+    /* Two-column card grid */
+    .cards-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+      align-items: start;
+    }
+    .cards-grid .card { margin-bottom: 0; }
+
+    /* Two-column top picks grid */
+    .top-picks-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+      max-width: 1100px;
+    }
+    .top-picks-grid .top-card { margin-bottom: 0; }
+    .top-picks-grid .top-empty { grid-column: 1 / -1; }
+  }
+
+  @media (min-width: 1400px) {
+    .wrap { max-width: 1440px; }
+    .cards-grid {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+    .top-picks-grid {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+  }
 </style>
 </head>
 <body>
 <div class="wrap">
   <h1>🎾 Tennis Betting Model</h1>
-  <p class="sub">{{ matches|length }} matches · Elo + weighted form · {{ 'ranked only' if ranked_only else 'all' }}</p>
+  <p class="sub">{{ matches|length }} matches · {{ selected_date_str }} · Elo + weighted form · {{ 'ranked only' if ranked_only else 'all' }}</p>
 
   <div class="toolbar">
-    <input id="q" placeholder="Filter by player or tournament…" autocomplete="off">
+    <input id="q" type="text" placeholder="Filter by player or tournament…" autocomplete="off">
+    <input type="date" id="date-picker" value="{{ selected_date_str }}"
+           max="{{ max_date_str }}"
+           onchange="changeDate(this.value)">
+    {% if not is_today %}
+      <a href="/?view={{ view }}&filter={{ 'ranked' if ranked_only else 'all' }}"
+         class="today-btn">↺ Today</a>
+    {% endif %}
     <a href="/tracker" class="primary">📋 Tracker</a>
   </div>
 
+  <div class="date-info">
+    <span class="badge {% if is_today %}today{% else %}past{% endif %}">
+      {% if is_today %}● Today{% else %}◷ {{ selected_date_str }}{% endif %}
+    </span>
+    <span>{{ weekday_name }}</span>
+  </div>
+
   <div class="view-toggle">
-    <a href="/?view=top&filter={{ 'all' if not ranked_only else 'ranked' }}"
+    <a href="/?view=top&date={{ selected_date_str }}&filter={{ 'all' if not ranked_only else 'ranked' }}"
        class="{% if view == 'top' %}active{% endif %}">
       🏆 Top {{ TOP_PICKS_LIMIT }} Picks
       <span class="badge">{{ top_picks|length }}</span>
     </a>
-    <a href="/?view=all&filter={{ 'all' if not ranked_only else 'ranked' }}"
+    <a href="/?view=all&date={{ selected_date_str }}&filter={{ 'all' if not ranked_only else 'ranked' }}"
        class="all-view {% if view == 'all' %}active{% endif %}">
       📋 All Matches
       <span class="badge">{{ matches|length }}</span>
@@ -817,18 +914,18 @@ PAGE = """
       Show edge when model ≥ <b>{{ '%.0f'|format(MODEL_SUPPORT_MIN_PROB*100) }}%</b>
       · auto-track MW ≥ <b>{{ '%.0f'|format(AUTO_TRACK_MIN_EDGE_MW*100) }}%</b>
       · Sets ≥ <b>{{ '%.0f'|format(AUTO_TRACK_MIN_EDGE_SETS*100) }}%</b>
-      <a href="/?view=all&filter={{ 'all' if not ranked_only else 'ranked' }}"
+      <a href="/?view=all&date={{ selected_date_str }}&filter={{ 'all' if not ranked_only else 'ranked' }}"
          style="margin-left:auto;font-size:11px;text-decoration:none;color:var(--p1)">
         {% if ranked_only %}All tours{% else %}Ranked only{% endif %}
       </a>
-      <a href="/?view=all&refresh=1&filter={{ 'ranked' if ranked_only else 'all' }}"
+      <a href="/?view=all&date={{ selected_date_str }}&refresh=1&filter={{ 'ranked' if ranked_only else 'all' }}"
          style="font-size:11px;text-decoration:none;color:var(--dim)">↻</a>
     </div>
   {% endif %}
 
   {% if view == 'top' %}
     <div class="top-header">
-      <h2>🏆 Today's Top Picks</h2>
+      <h2>🏆 Top Picks — {{ selected_date_str }}</h2>
       <div class="criteria">
         model ≥ <b>{{ '%.0f'|format(MODEL_SUPPORT_MIN_PROB*100) }}%</b>
         · odds ≥ <b>{{ '%.2f'|format(TOP_PICKS_MIN_ODDS) }}</b>
@@ -836,206 +933,222 @@ PAGE = """
       </div>
     </div>
 
-    {% if top_picks|length == 0 %}
-      <div class="top-empty">
-        <b>No qualifying picks today.</b><br>
-        Nothing meets: model ≥ {{ '%.0f'|format(MODEL_SUPPORT_MIN_PROB*100) }}% ·
-        odds ≥ {{ '%.2f'|format(TOP_PICKS_MIN_ODDS) }}<br><br>
-        <a href="/?view=all&filter={{ 'ranked' if ranked_only else 'all' }}"
-           style="color:var(--p1)">Browse all matches →</a>
-      </div>
-    {% else %}
-      {% for tp in top_picks %}
-        <div class="top-card {% if tp.market == 'sets' %}sets{% endif %}">
-          <div class="top-card-rank">#{{ loop.index }}</div>
-          <div class="top-tourney">
-            <span class="mkt-badge">{{ 'MW' if tp.market == 'mw' else 'SETS' }}</span>
-            {{ tp.match.tournament }} · {{ tp.match.surface|title }}
-            {% if tp.match.round %} · {{ tp.match.round }}{% endif %}
-            {% if tp.match.time %} · {{ tp.match.time }} GMT+3{% endif %}
-          </div>
-          <div class="top-pick-row">
-            <div>
-              <div class="top-pick-name">{{ tp.pick_name }}</div>
-              <div class="top-pick-opp">{{ tp.opp_name }} · {{ tp.bookmaker }}</div>
-            </div>
-            <div class="top-pick-edge">
-              <div class="num">{{ '%+.1f'|format(tp.edge*100) }}%</div>
-              <div class="lbl">Edge</div>
-            </div>
-          </div>
-          <div class="top-stats">
-            <div class="top-stat">
-              <div class="k">Model</div>
-              <div class="v prob">{{ '%.1f'|format(tp.prob*100) }}%</div>
-            </div>
-            <div class="top-stat">
-              <div class="k">Implied</div>
-              <div class="v">{{ '%.1f'|format(tp.implied*100) }}%</div>
-            </div>
-            <div class="top-stat">
-              <div class="k">Odds</div>
-              <div class="v odds">{{ '%.2f'|format(tp.odds) }}</div>
-            </div>
-            <div class="top-stat">
-              <div class="k">Edge</div>
-              <div class="v" style="color:var(--hit)">{{ '%+.1f'|format(tp.edge*100) }}%</div>
-            </div>
-          </div>
+    <div class="top-picks-grid">
+      {% if top_picks|length == 0 %}
+        <div class="top-empty">
+          <b>No qualifying picks for this date.</b><br>
+          Nothing meets: model ≥ {{ '%.0f'|format(MODEL_SUPPORT_MIN_PROB*100) }}% ·
+          odds ≥ {{ '%.2f'|format(TOP_PICKS_MIN_ODDS) }}<br><br>
+          <a href="/?view=all&date={{ selected_date_str }}&filter={{ 'ranked' if ranked_only else 'all' }}"
+             style="color:var(--p1)">Browse all matches →</a>
         </div>
-      {% endfor %}
-    {% endif %}
+      {% else %}
+        {% for tp in top_picks %}
+          <div class="top-card {% if tp.market == 'sets' %}sets{% endif %}">
+            <div class="top-card-rank">#{{ loop.index }}</div>
+            <div class="top-tourney">
+              <span class="mkt-badge">{{ 'MW' if tp.market == 'mw' else 'SETS' }}</span>
+              {{ tp.match.tournament }} · {{ tp.match.surface|title }}
+              {% if tp.match.round %} · {{ tp.match.round }}{% endif %}
+              {% if tp.match.time %} · {{ tp.match.time }} GMT+3{% endif %}
+            </div>
+            <div class="top-pick-row">
+              <div>
+                <div class="top-pick-name">{{ tp.pick_name }}</div>
+                <div class="top-pick-opp">{{ tp.opp_name }} · {{ tp.bookmaker }}</div>
+              </div>
+              <div class="top-pick-edge">
+                <div class="num">{{ '%+.1f'|format(tp.edge*100) }}%</div>
+                <div class="lbl">Edge</div>
+              </div>
+            </div>
+            <div class="top-stats">
+              <div class="top-stat">
+                <div class="k">Model</div>
+                <div class="v prob">{{ '%.1f'|format(tp.prob*100) }}%</div>
+              </div>
+              <div class="top-stat">
+                <div class="k">Implied</div>
+                <div class="v">{{ '%.1f'|format(tp.implied*100) }}%</div>
+              </div>
+              <div class="top-stat">
+                <div class="k">Odds</div>
+                <div class="v odds">{{ '%.2f'|format(tp.odds) }}</div>
+              </div>
+              <div class="top-stat">
+                <div class="k">Edge</div>
+                <div class="v" style="color:var(--hit)">{{ '%+.1f'|format(tp.edge*100) }}%</div>
+              </div>
+            </div>
+          </div>
+        {% endfor %}
+      {% endif %}
+    </div>
 
   {% else %}
     {% if matches|length == 0 %}
       <div class="empty">
-        No matches. Try <a href="/?view=all&refresh=1">refreshing</a>.
+        No matches on {{ selected_date_str }}.
+        {% if not is_today %}
+          <a href="/?view={{ view }}&filter={{ 'ranked' if ranked_only else 'all' }}">Back to today →</a>
+        {% else %}
+          Try <a href="/?view=all&refresh=1">refreshing</a>.
+        {% endif %}
       </div>
     {% endif %}
 
-    {% for m in matches %}
-      {% set s = odds_map.get(m.match.id, {}) %}
-      {% set bo = m.match.bookmaker_odds %}
-      {% set so_data = m.match.sets_odds %}
-      {% set mw1 = s.get('mw1') if s.get('mw1') else (bo.p1_odds if bo else m.pred.fair_mw1) %}
-      {% set mw2 = s.get('mw2') if s.get('mw2') else (bo.p2_odds if bo else m.pred.fair_mw2) %}
-      {% set so = s.get('so') if s.get('so') else (so_data.over_odds if so_data else m.pred.fair_so) %}
-      {% set su = s.get('su') if s.get('su') else (so_data.under_odds if so_data else m.pred.fair_su) %}
-      {% set is_default = not (s.get('mw1')) %}
-      {% set is_book = bo and not (s.get('mw1')) %}
-      {% set is_sets_book = so_data and not (s.get('so')) %}
-      {% set p1p = m.pred.prob %}
-      {% set p2p = 1 - p1p %}
-      {% set p_over_sets = m.pred.p_3sets %}
-      {% set p_under_sets = 1 - p_over_sets %}
-      {% set e_mw1 = p1p - (1/mw1) %}
-      {% set e_mw2 = p2p - (1/mw2) %}
-      {% set e_so  = p_over_sets - (1/so) %}
-      {% set e_su  = p_under_sets - (1/su) %}
+    <div class="cards-grid">
+      {% for m in matches %}
+        {% set s = odds_map.get(m.match.id, {}) %}
+        {% set bo = m.match.bookmaker_odds %}
+        {% set so_data = m.match.sets_odds %}
+        {% set mw1 = s.get('mw1') if s.get('mw1') else (bo.p1_odds if bo else m.pred.fair_mw1) %}
+        {% set mw2 = s.get('mw2') if s.get('mw2') else (bo.p2_odds if bo else m.pred.fair_mw2) %}
+        {% set so = s.get('so') if s.get('so') else (so_data.over_odds if so_data else m.pred.fair_so) %}
+        {% set su = s.get('su') if s.get('su') else (so_data.under_odds if so_data else m.pred.fair_su) %}
+        {% set is_default = not (s.get('mw1')) %}
+        {% set is_book = bo and not (s.get('mw1')) %}
+        {% set is_sets_book = so_data and not (s.get('so')) %}
+        {% set p1p = m.pred.prob %}
+        {% set p2p = 1 - p1p %}
+        {% set p_over_sets = m.pred.p_3sets %}
+        {% set p_under_sets = 1 - p_over_sets %}
+        {% set e_mw1 = p1p - (1/mw1) %}
+        {% set e_mw2 = p2p - (1/mw2) %}
+        {% set e_so  = p_over_sets - (1/so) %}
+        {% set e_su  = p_under_sets - (1/su) %}
 
-      {% set sup_mw1 = p1p >= MODEL_SUPPORT_MIN_PROB %}
-      {% set sup_mw2 = p2p >= MODEL_SUPPORT_MIN_PROB %}
-      {% set sup_so  = p_over_sets >= MODEL_SUPPORT_MIN_PROB %}
-      {% set sup_su  = p_under_sets >= MODEL_SUPPORT_MIN_PROB %}
+        {% set sup_mw1 = p1p >= MODEL_SUPPORT_MIN_PROB %}
+        {% set sup_mw2 = p2p >= MODEL_SUPPORT_MIN_PROB %}
+        {% set sup_so  = p_over_sets >= MODEL_SUPPORT_MIN_PROB %}
+        {% set sup_su  = p_under_sets >= MODEL_SUPPORT_MIN_PROB %}
 
-      {% set tracked_mw1 = sup_mw1 and e_mw1 >= AUTO_TRACK_MIN_EDGE_MW and ('mw' in AUTO_TRACK_MARKETS) %}
-      {% set tracked_mw2 = sup_mw2 and e_mw2 >= AUTO_TRACK_MIN_EDGE_MW and ('mw' in AUTO_TRACK_MARKETS) %}
-      {% set tracked_so  = sup_so and e_so >= AUTO_TRACK_MIN_EDGE_SETS and ('sets' in AUTO_TRACK_MARKETS) %}
-      {% set tracked_su  = sup_su and e_su >= AUTO_TRACK_MIN_EDGE_SETS and ('sets' in AUTO_TRACK_MARKETS) %}
+        {% set tracked_mw1 = sup_mw1 and e_mw1 >= AUTO_TRACK_MIN_EDGE_MW and ('mw' in AUTO_TRACK_MARKETS) %}
+        {% set tracked_mw2 = sup_mw2 and e_mw2 >= AUTO_TRACK_MIN_EDGE_MW and ('mw' in AUTO_TRACK_MARKETS) %}
+        {% set tracked_so  = sup_so and e_so >= AUTO_TRACK_MIN_EDGE_SETS and ('sets' in AUTO_TRACK_MARKETS) %}
+        {% set tracked_su  = sup_su and e_su >= AUTO_TRACK_MIN_EDGE_SETS and ('sets' in AUTO_TRACK_MARKETS) %}
 
-      {% set card_dual = tracked_mw1 or tracked_mw2 or tracked_so or tracked_su %}
+        {% set card_dual = tracked_mw1 or tracked_mw2 or tracked_so or tracked_su %}
 
-      <div class="card {% if card_dual %}dual{% endif %}" data-match="{{ m.match.id }}">
-        <div class="card-head">
-          <div class="tourney">
-            <span class="dot"></span>{{ m.match.tournament }} · {{ m.match.surface|title }}{% if m.match.round %} · {{ m.match.round }}{% endif %}
-            {% if m.match.time %}<span class="time-badge">🕐 {{ m.match.time }} GMT+3</span>{% endif %}
-            {% if bo %}<span class="bm-badge">💰 {{ bo.bookmaker }}</span>{% endif %}
-            {% if card_dual %}<span class="dual-badge">◆ auto</span>{% endif %}
-            <span class="src">{{ m.match.source }}</span>
-          </div>
-          <div class="matchup">
-            <div class="side">
-              <div class="pname">{{ m.p1.name }}</div>
-              <div class="pmeta">Rank <b>{% if m.p1.ranking %}#{{ m.p1.ranking }}{% else %}NR{% endif %}</b> · Elo <b>{{ '%.0f'|format(m.pred.e1) }}</b></div>
-              {% if m.p1_recent %}
-                <div class="form-strip">
-                  {% for r in m.p1_recent %}<div class="form-dot {{ 'w' if r.result == 'W' else 'l' }}">{{ r.result }}</div>{% endfor %}
-                </div>
-              {% endif %}
+        <div class="card {% if card_dual %}dual{% endif %}" data-match="{{ m.match.id }}">
+          <div class="card-head">
+            <div class="tourney">
+              <span class="dot"></span>{{ m.match.tournament }} · {{ m.match.surface|title }}{% if m.match.round %} · {{ m.match.round }}{% endif %}
+              {% if m.match.time %}<span class="time-badge">🕐 {{ m.match.time }} GMT+3</span>{% endif %}
+              {% if bo %}<span class="bm-badge">💰 {{ bo.bookmaker }}</span>{% endif %}
+              {% if card_dual %}<span class="dual-badge">◆ auto</span>{% endif %}
+              <span class="src">{{ m.match.source }}</span>
             </div>
-            <div class="vs-div">VS</div>
-            <div class="side right">
-              <div class="pname">{{ m.p2.name }}</div>
-              <div class="pmeta">Rank <b>{% if m.p2.ranking %}#{{ m.p2.ranking }}{% else %}NR{% endif %}</b> · Elo <b>{{ '%.0f'|format(m.pred.e2) }}</b></div>
-              {% if m.p2_recent %}
-                <div class="form-strip right">
-                  {% for r in m.p2_recent %}<div class="form-dot {{ 'w' if r.result == 'W' else 'l' }}">{{ r.result }}</div>{% endfor %}
-                </div>
-              {% endif %}
+            <div class="matchup">
+              <div class="side">
+                <div class="pname">{{ m.p1.name }}</div>
+                <div class="pmeta">Rank <b>{% if m.p1.ranking %}#{{ m.p1.ranking }}{% else %}NR{% endif %}</b> · Elo <b>{{ '%.0f'|format(m.pred.e1) }}</b></div>
+                {% if m.p1_recent %}
+                  <div class="form-strip">
+                    {% for r in m.p1_recent %}<div class="form-dot {{ 'w' if r.result == 'W' else 'l' }}">{{ r.result }}</div>{% endfor %}
+                  </div>
+                {% endif %}
+              </div>
+              <div class="vs-div">VS</div>
+              <div class="side right">
+                <div class="pname">{{ m.p2.name }}</div>
+                <div class="pmeta">Rank <b>{% if m.p2.ranking %}#{{ m.p2.ranking }}{% else %}NR{% endif %}</b> · Elo <b>{{ '%.0f'|format(m.pred.e2) }}</b></div>
+                {% if m.p2_recent %}
+                  <div class="form-strip right">
+                    {% for r in m.p2_recent %}<div class="form-dot {{ 'w' if r.result == 'W' else 'l' }}">{{ r.result }}</div>{% endfor %}
+                  </div>
+                {% endif %}
+              </div>
+            </div>
+            <div class="pbar">
+              <div class="a" style="width: {{ p1p*100 }}%"></div>
+              <div class="b" style="width: {{ p2p*100 }}%"></div>
             </div>
           </div>
-          <div class="pbar">
-            <div class="a" style="width: {{ p1p*100 }}%"></div>
-            <div class="b" style="width: {{ p2p*100 }}%"></div>
-          </div>
-        </div>
 
-        <div class="market">
-          <div class="mkt-title"><span>Match Winner</span>
-            <span class="hint">{{ '%.1f'|format(p1p*100) }} / {{ '%.1f'|format(p2p*100) }}</span></div>
-          <div class="mrow">
-            <div class="label"><span class="swatch p1"></span><span class="lbl-text">{{ m.p1.name }}</span></div>
-            <div class="prob {% if not sup_mw1 %}muted{% endif %}">{{ '%.1f'|format(p1p*100) }}%</div>
-            <input class="odds {% if not sup_mw1 %}muted{% elif is_book %}bookmaker{% elif is_default %}default{% endif %}" value="{{ mw1 }}" readonly>
-            {% if sup_mw1 %}
-              <div class="edge {{ 'hit' if e_mw1>0.03 else ('neg' if e_mw1<-0.03 else 'miss') }}">{{ '%+.1f'|format(e_mw1*100) }}%</div>
-            {% else %}
-              <div class="edge empty"></div>
-            {% endif %}
-            {% if tracked_mw1 %}<div class="auto-dot">◆</div>
-            {% else %}<div class="auto-dot placeholder"></div>{% endif %}
+          <div class="market">
+            <div class="mkt-title"><span>Match Winner</span>
+              <span class="hint">{{ '%.1f'|format(p1p*100) }} / {{ '%.1f'|format(p2p*100) }}</span></div>
+            <div class="mrow">
+              <div class="label"><span class="swatch p1"></span><span class="lbl-text">{{ m.p1.name }}</span></div>
+              <div class="prob {% if not sup_mw1 %}muted{% endif %}">{{ '%.1f'|format(p1p*100) }}%</div>
+              <input class="odds {% if not sup_mw1 %}muted{% elif is_book %}bookmaker{% elif is_default %}default{% endif %}" value="{{ mw1 }}" readonly>
+              {% if sup_mw1 %}
+                <div class="edge {{ 'hit' if e_mw1>0.03 else ('neg' if e_mw1<-0.03 else 'miss') }}">{{ '%+.1f'|format(e_mw1*100) }}%</div>
+              {% else %}
+                <div class="edge empty"></div>
+              {% endif %}
+              {% if tracked_mw1 %}<div class="auto-dot">◆</div>
+              {% else %}<div class="auto-dot placeholder"></div>{% endif %}
+            </div>
+            <div class="mrow">
+              <div class="label"><span class="swatch p2"></span><span class="lbl-text">{{ m.p2.name }}</span></div>
+              <div class="prob {% if not sup_mw2 %}muted{% endif %}">{{ '%.1f'|format(p2p*100) }}%</div>
+              <input class="odds {% if not sup_mw2 %}muted{% elif is_book %}bookmaker{% elif is_default %}default{% endif %}" value="{{ mw2 }}" readonly>
+              {% if sup_mw2 %}
+                <div class="edge {{ 'hit' if e_mw2>0.03 else ('neg' if e_mw2<-0.03 else 'miss') }}">{{ '%+.1f'|format(e_mw2*100) }}%</div>
+              {% else %}
+                <div class="edge empty"></div>
+              {% endif %}
+              {% if tracked_mw2 %}<div class="auto-dot">◆</div>
+              {% else %}<div class="auto-dot placeholder"></div>{% endif %}
+            </div>
           </div>
-          <div class="mrow">
-            <div class="label"><span class="swatch p2"></span><span class="lbl-text">{{ m.p2.name }}</span></div>
-            <div class="prob {% if not sup_mw2 %}muted{% endif %}">{{ '%.1f'|format(p2p*100) }}%</div>
-            <input class="odds {% if not sup_mw2 %}muted{% elif is_book %}bookmaker{% elif is_default %}default{% endif %}" value="{{ mw2 }}" readonly>
-            {% if sup_mw2 %}
-              <div class="edge {{ 'hit' if e_mw2>0.03 else ('neg' if e_mw2<-0.03 else 'miss') }}">{{ '%+.1f'|format(e_mw2*100) }}%</div>
-            {% else %}
-              <div class="edge empty"></div>
-            {% endif %}
-            {% if tracked_mw2 %}<div class="auto-dot">◆</div>
-            {% else %}<div class="auto-dot placeholder"></div>{% endif %}
-          </div>
-        </div>
 
-        <div class="market">
-          <div class="mkt-title">
-            <span class="left">Sets · O/U {{ so_data.line if so_data else DEFAULT_SETS_LINE }}
-              {% if so_data %}<span class="bm-inline">💰 {{ so_data.bookmaker }}</span>{% else %}<span class="hint" style="color:#4a5270;font-size:9.5px"> · fair only</span>{% endif %}
-            </span>
-            <span class="hint">{{ '%.1f'|format(p_over_sets*100) }} / {{ '%.1f'|format(p_under_sets*100) }}</span>
+          <div class="market">
+            <div class="mkt-title">
+              <span class="left">Sets · O/U {{ so_data.line if so_data else DEFAULT_SETS_LINE }}
+                {% if so_data %}<span class="bm-inline">💰 {{ so_data.bookmaker }}</span>{% else %}<span class="hint" style="color:#4a5270;font-size:9.5px"> · fair only</span>{% endif %}
+              </span>
+              <span class="hint">{{ '%.1f'|format(p_over_sets*100) }} / {{ '%.1f'|format(p_under_sets*100) }}</span>
+            </div>
+            <div class="mrow">
+              <div class="label"><span class="swatch n"></span><span class="lbl-text">Over {{ so_data.line if so_data else DEFAULT_SETS_LINE }}</span></div>
+              <div class="prob {% if not sup_so %}muted{% endif %}">{{ '%.1f'|format(p_over_sets*100) }}%</div>
+              <input class="odds {% if not sup_so %}muted{% elif is_sets_book %}bookmaker{% else %}default{% endif %}" value="{{ so }}" readonly>
+              {% if sup_so %}
+                <div class="edge {{ 'hit' if e_so>0.03 else ('neg' if e_so<-0.03 else 'miss') }}">{{ '%+.1f'|format(e_so*100) }}%</div>
+              {% else %}
+                <div class="edge empty"></div>
+              {% endif %}
+              {% if tracked_so %}<div class="auto-dot">◆</div>
+              {% else %}<div class="auto-dot placeholder"></div>{% endif %}
+            </div>
+            <div class="mrow">
+              <div class="label"><span class="swatch n"></span><span class="lbl-text">Under {{ so_data.line if so_data else DEFAULT_SETS_LINE }}</span></div>
+              <div class="prob {% if not sup_su %}muted{% endif %}">{{ '%.1f'|format(p_under_sets*100) }}%</div>
+              <input class="odds {% if not sup_su %}muted{% elif is_sets_book %}bookmaker{% else %}default{% endif %}" value="{{ su }}" readonly>
+              {% if sup_su %}
+                <div class="edge {{ 'hit' if e_su>0.03 else ('neg' if e_su<-0.03 else 'miss') }}">{{ '%+.1f'|format(e_su*100) }}%</div>
+              {% else %}
+                <div class="edge empty"></div>
+              {% endif %}
+              {% if tracked_su %}<div class="auto-dot">◆</div>
+              {% else %}<div class="auto-dot placeholder"></div>{% endif %}
+            </div>
           </div>
-          <div class="mrow">
-            <div class="label"><span class="swatch n"></span><span class="lbl-text">Over {{ so_data.line if so_data else DEFAULT_SETS_LINE }}</span></div>
-            <div class="prob {% if not sup_so %}muted{% endif %}">{{ '%.1f'|format(p_over_sets*100) }}%</div>
-            <input class="odds {% if not sup_so %}muted{% elif is_sets_book %}bookmaker{% else %}default{% endif %}" value="{{ so }}" readonly>
-            {% if sup_so %}
-              <div class="edge {{ 'hit' if e_so>0.03 else ('neg' if e_so<-0.03 else 'miss') }}">{{ '%+.1f'|format(e_so*100) }}%</div>
-            {% else %}
-              <div class="edge empty"></div>
-            {% endif %}
-            {% if tracked_so %}<div class="auto-dot">◆</div>
-            {% else %}<div class="auto-dot placeholder"></div>{% endif %}
-          </div>
-          <div class="mrow">
-            <div class="label"><span class="swatch n"></span><span class="lbl-text">Under {{ so_data.line if so_data else DEFAULT_SETS_LINE }}</span></div>
-            <div class="prob {% if not sup_su %}muted{% endif %}">{{ '%.1f'|format(p_under_sets*100) }}%</div>
-            <input class="odds {% if not sup_su %}muted{% elif is_sets_book %}bookmaker{% else %}default{% endif %}" value="{{ su }}" readonly>
-            {% if sup_su %}
-              <div class="edge {{ 'hit' if e_su>0.03 else ('neg' if e_su<-0.03 else 'miss') }}">{{ '%+.1f'|format(e_su*100) }}%</div>
-            {% else %}
-              <div class="edge empty"></div>
-            {% endif %}
-            {% if tracked_su %}<div class="auto-dot">◆</div>
-            {% else %}<div class="auto-dot placeholder"></div>{% endif %}
-          </div>
-        </div>
 
-        <div class="card-foot">
-          <div class="breakdown">
-            <div class="bd">Elo<b>{{ '%.0f'|format(m.pred.p_elo*100) }}%</b></div>
-            <div class="bd">Form<b>{{ '%.0f'|format(m.pred.p_form*100) }}%</b></div>
-            <div class="bd">Rank<b>{{ '%.0f'|format(m.pred.p_rank*100) }}%</b></div>
+          <div class="card-foot">
+            <div class="breakdown">
+              <div class="bd">Elo<b>{{ '%.0f'|format(m.pred.p_elo*100) }}%</b></div>
+              <div class="bd">Form<b>{{ '%.0f'|format(m.pred.p_form*100) }}%</b></div>
+              <div class="bd">Rank<b>{{ '%.0f'|format(m.pred.p_rank*100) }}%</b></div>
+            </div>
           </div>
         </div>
-      </div>
-    {% endfor %}
+      {% endfor %}
+    </div>
   {% endif %}
 </div>
 
 <script>
+  function changeDate(val) {
+    if (!val) return;
+    const url = new URL(window.location.href);
+    url.searchParams.set('date', val);
+    window.location = url.toString();
+  }
+
   const q = document.getElementById('q');
   if (q) {
     q.addEventListener('input', e => {
@@ -1113,6 +1226,7 @@ TRACKER_PAGE = """
     text-decoration:none;border:1px solid var(--line);color:var(--dim2)}
   .filters a.active{background:linear-gradient(90deg,var(--p1),var(--p2));
     color:#0a0d1a;font-weight:700;border-color:transparent}
+  .picks-grid{display:block}
   .pick{
     background:linear-gradient(180deg,rgba(255,255,255,0.045),rgba(255,255,255,0.012));
     border:1px solid var(--line);border-radius:14px;
@@ -1159,6 +1273,19 @@ TRACKER_PAGE = """
     border-radius:14px;padding:22px;text-align:center;color:var(--dim2);
     font-size:13px;line-height:1.6}
   a{color:var(--p1)}
+
+  @media (min-width: 900px) {
+    body { padding: 32px 24px 80px; }
+    .wrap { max-width: 1280px; }
+    .nav, .stats, .filters { max-width: 900px; }
+    .picks-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+      align-items: start;
+    }
+    .picks-grid .pick { margin-bottom: 0; }
+  }
 </style>
 </head>
 <body>
@@ -1230,41 +1357,43 @@ TRACKER_PAGE = """
     </div>
   {% endif %}
 
-  {% for p in picks %}
-    <div class="pick {{ p.status }}">
-      <div class="pick-head">
-        <div class="pick-name">
-          <span class="pick-market">{{ (p.market or 'mw')|upper }}</span>
-          {{ p.pick_name }}
+  <div class="picks-grid">
+    {% for p in picks %}
+      <div class="pick {{ p.status }}">
+        <div class="pick-head">
+          <div class="pick-name">
+            <span class="pick-market">{{ (p.market or 'mw')|upper }}</span>
+            {{ p.pick_name }}
+          </div>
+          <div class="pick-status {{ p.status }}">{{ p.status }}</div>
         </div>
-        <div class="pick-status {{ p.status }}">{{ p.status }}</div>
-      </div>
-      <div class="pick-meta">
-        vs {{ p.opponent_name }} · {{ p.tournament }} · {{ p.surface|title }}
-        {% if p.match_time %} · {{ p.match_time }} GMT+3{% endif %}
-        · {{ p.bookmaker or 'n/a' }}
-      </div>
-      <div class="pick-row">
-        <div class="kv"><div class="k">Model</div><div class="v">{{ '%.1f'|format(p.model_prob*100) }}%</div></div>
-        <div class="kv"><div class="k">Odds</div><div class="v">{{ '%.2f'|format(p.book_odds) }}</div></div>
-        <div class="kv"><div class="k">Implied</div><div class="v">{{ '%.1f'|format(100/p.book_odds) }}%</div></div>
-        <div class="kv"><div class="k">Edge</div><div class="v" style="color:var(--hit)">{{ '%+.1f'|format(p.edge*100) }}%</div></div>
-      </div>
-      {% if p.status == 'open' %}
-        <div class="actions">
-          <form method="post" action="/settle/{{ p.id }}/won">
-            <button class="btn-won" type="submit">✓ Won</button>
-          </form>
-          <form method="post" action="/settle/{{ p.id }}/lost">
-            <button class="btn-lost" type="submit">✗ Lost</button>
-          </form>
-          <form method="post" action="/settle/{{ p.id }}/void">
-            <button class="btn-void" type="submit">Void</button>
-          </form>
+        <div class="pick-meta">
+          vs {{ p.opponent_name }} · {{ p.tournament }} · {{ p.surface|title }}
+          {% if p.match_time %} · {{ p.match_time }} GMT+3{% endif %}
+          · {{ p.bookmaker or 'n/a' }}
         </div>
-      {% endif %}
-    </div>
-  {% endfor %}
+        <div class="pick-row">
+          <div class="kv"><div class="k">Model</div><div class="v">{{ '%.1f'|format(p.model_prob*100) }}%</div></div>
+          <div class="kv"><div class="k">Odds</div><div class="v">{{ '%.2f'|format(p.book_odds) }}</div></div>
+          <div class="kv"><div class="k">Implied</div><div class="v">{{ '%.1f'|format(100/p.book_odds) }}%</div></div>
+          <div class="kv"><div class="k">Edge</div><div class="v" style="color:var(--hit)">{{ '%+.1f'|format(p.edge*100) }}%</div></div>
+        </div>
+        {% if p.status == 'open' %}
+          <div class="actions">
+            <form method="post" action="/settle/{{ p.id }}/won">
+              <button class="btn-won" type="submit">✓ Won</button>
+            </form>
+            <form method="post" action="/settle/{{ p.id }}/lost">
+              <button class="btn-lost" type="submit">✗ Lost</button>
+            </form>
+            <form method="post" action="/settle/{{ p.id }}/void">
+              <button class="btn-void" type="submit">Void</button>
+            </form>
+          </div>
+        {% endif %}
+      </div>
+    {% endfor %}
+  </div>
 </div>
 </body>
 </html>
@@ -1272,8 +1401,10 @@ TRACKER_PAGE = """
 
 
 # =================== Routes ===================
-def build_matches_with_markets(ranked_only=True, force=False):
-    matches = load_matches(ranked_only=ranked_only, force=force)
+def build_matches_with_markets(ranked_only=True, force=False,
+                                target_date=None):
+    matches = load_matches(ranked_only=ranked_only, force=force,
+                           target_date=target_date)
     for m in matches:
         p = m["pred"]
         p["fair_mw1"] = fair_odds(p["prob"])
@@ -1291,16 +1422,35 @@ def index():
     if view not in ("top", "all"):
         view = "top"
 
+    # Parse date (defaults to today in Nairobi)
+    today = datetime.now(NAIROBI_TZ).date()
+    date_str = request.args.get("date", "").strip()
     try:
-        matches = build_matches_with_markets(ranked_only=ranked_only, force=force)
+        selected_date = (datetime.strptime(date_str, "%Y-%m-%d").date()
+                        if date_str else today)
+    except ValueError:
+        selected_date = today
+
+    is_today = selected_date == today
+    selected_date_str = selected_date.isoformat()
+    max_date_str = (today + __import__("datetime").timedelta(days=30)).isoformat()
+    weekday_name = selected_date.strftime("%A, %d %B %Y")
+
+    try:
+        matches = build_matches_with_markets(
+            ranked_only=ranked_only, force=force,
+            target_date=selected_date,
+        )
     except Exception as e:
         return f"<pre style='color:#f87171;padding:24px'>Error: {e}</pre>", 500
 
+    # Auto-track ONLY for today (past/future matches are already decided)
     auto_added = 0
-    try:
-        auto_added = _auto_track_picks(matches)
-    except Exception as e:
-        print(f"[auto-track] error: {e}")
+    if is_today:
+        try:
+            auto_added = _auto_track_picks(matches)
+        except Exception as e:
+            print(f"[auto-track] error: {e}")
 
     top_picks = compute_top_picks(matches)
 
@@ -1311,6 +1461,10 @@ def index():
         ranked_only=ranked_only,
         view=view,
         top_picks=top_picks,
+        selected_date_str=selected_date_str,
+        max_date_str=max_date_str,
+        is_today=is_today,
+        weekday_name=weekday_name,
         DEFAULT_SETS_LINE=DEFAULT_SETS_LINE,
         MODEL_SUPPORT_MIN_PROB=MODEL_SUPPORT_MIN_PROB,
         AUTO_TRACK_MIN_EDGE_MW=AUTO_TRACK_MIN_EDGE_MW,

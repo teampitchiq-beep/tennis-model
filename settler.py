@@ -1,14 +1,14 @@
 """
-Automatic settlement of open picks.
+Automatic settlement of open MW picks.
 
-For each open pick, fetch its TennisExplorer match-detail page and parse
-the result. If the match has finished, settle the pick as won or lost.
-
-Match-detail header format (TE convention, left-first):
-    "Left Name 2 : 1 (4-6, 6-3, 6-2) Right Name"
+- Skips non-MW picks (legacy Sets) — auto-voids them
+- Auto-voids picks older than STALE_DAYS (unsettleable)
+- Fetches in parallel (4 workers) to avoid blocking startup
 """
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 
 import requests
 from bs4 import BeautifulSoup
@@ -19,17 +19,16 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
       "AppleWebKit/537.36 (KHTML, like Gecko) "
       "Chrome/121.0.0.0 Safari/537.36")
 
-# Matches: "Name A 2 : 1 (4-6, 6-3, 6-2) Name B"
-# Also handles no-spaces and missing score string
 HEADER_RE = re.compile(
     r"^(.+?)\s+(\d+)\s*:\s*(\d+)\s*(?:\(\s*([^)]*)\s*\))?\s+(.+?)\s*$"
 )
 
-# Rate limit between pick fetches (seconds)
-FETCH_DELAY = 1.0
+FETCH_WORKERS = 4
+FETCH_TIMEOUT = 15
+
+STALE_DAYS = 5
 
 
-# ============= Helpers =============
 def _surname_sig(name):
     if not name:
         return ""
@@ -50,20 +49,17 @@ def _name_match(tracked, result_name):
 def _fetch_te_match(te_id):
     url = f"https://www.tennisexplorer.com/match-detail/?id={te_id}"
     try:
-        r = requests.get(url, headers={"User-Agent": UA}, timeout=20)
+        r = requests.get(url, headers={"User-Agent": UA},
+                         timeout=FETCH_TIMEOUT)
         if r.status_code != 200:
             return None
         return BeautifulSoup(r.text, "lxml")
-    except Exception as e:
-        print(f"[settler] {te_id}: {e}")
+    except Exception:
         return None
 
 
 def _parse_result(soup):
-    """
-    Return (winner_name, loser_name) if the match has finished, else None.
-    """
-    # Match-detail page has a table with class 'result' near the top
+    """Return (winner_name, loser_name) if finished, else None."""
     table = soup.find("table", class_="result")
     if not table:
         return None
@@ -83,16 +79,10 @@ def _parse_result(soup):
         score = (m.group(4) or "").strip()
         name_b = m.group(5).strip()
 
-        # Sanity: best-of-3 gives max 3 sets; skip anything wild
         if sets_a > 5 or sets_b > 5:
             continue
-
-        # Not started or still in progress: no completed sets
         if sets_a + sets_b == 0:
             continue
-
-        # Check that the score string looks like completed sets
-        # e.g. "4-6, 6-3, 6-2" — at least one completed set with a dash
         if score and "-" not in score:
             continue
 
@@ -104,69 +94,113 @@ def _parse_result(soup):
     return None
 
 
-# ============= Main =============
+def _age_days(pick):
+    ts = pick.get("created_at")
+    if not ts:
+        return 0
+    try:
+        created = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        return (now - created).total_seconds() / 86400
+    except Exception:
+        return 0
+
+
+def _process_pick(p):
+    """
+    Returns a tuple: (pick_id, status, detail)
+    status: 'won' | 'lost' | 'void' | 'skip' | 'error'
+    """
+    market = (p.get("market") or "mw").lower()
+    if market != "mw":
+        return (p["id"], "void", "legacy non-MW pick")
+
+    if _age_days(p) > STALE_DAYS:
+        return (p["id"], "void", f"stale (>{STALE_DAYS}d old)")
+
+    te_id = p.get("te_match_id")
+    if not te_id:
+        return (p["id"], "skip", "no te_match_id")
+
+    soup = _fetch_te_match(te_id)
+    if soup is None:
+        return (p["id"], "error", "fetch failed")
+
+    result = _parse_result(soup)
+    if not result:
+        return (p["id"], "skip", "match not finished")
+
+    winner, loser = result
+
+    if _name_match(p["pick_name"], winner):
+        return (p["id"], "won", f"beat {loser}")
+    if _name_match(p["pick_name"], loser):
+        return (p["id"], "lost", f"lost to {winner}")
+    return (p["id"], "skip", f"no name match (winner={winner})")
+
+
 def settle_open_picks(verbose=True):
-    """
-    Fetch result for every open pick, settle if determinable.
-    Returns a dict with counts.
-    """
     picks = tracker.list_picks(status="open")
     if not picks:
-        return {"checked": 0, "settled": 0, "skipped": 0, "errors": 0}
+        return {"checked": 0, "settled": 0, "skipped": 0,
+                "errors": 0, "voided": 0, "results": [], "elapsed": 0.0}
 
     settled = 0
     skipped = 0
     errors = 0
+    voided = 0
     results = []
 
-    for i, p in enumerate(picks):
-        te_id = p.get("te_match_id")
-        if not te_id:
-            skipped += 1
-            if verbose:
-                print(f"[settler] pick {p['id']}: no te_match_id, skipping")
-            continue
+    t0 = time.time()
 
-        soup = _fetch_te_match(te_id)
-        if soup is None:
-            errors += 1
-            continue
+    with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as pool:
+        futures = {pool.submit(_process_pick, p): p for p in picks}
+        for f in as_completed(futures):
+            p = futures[f]
+            try:
+                pid, status, detail = f.result()
+            except Exception as e:
+                pid, status, detail = p["id"], "error", str(e)
 
-        result = _parse_result(soup)
-        if not result:
-            skipped += 1
-            if verbose:
-                print(f"[settler] pick {p['id']}: match not finished")
-            continue
+            if status == "won":
+                tracker.settle_pick(pid, "won")
+                settled += 1
+                results.append((pid, p["pick_name"], "won"))
+                if verbose:
+                    print(f"[settler] pick {pid}: {p['pick_name']} WON ({detail})")
+            elif status == "lost":
+                tracker.settle_pick(pid, "lost")
+                settled += 1
+                results.append((pid, p["pick_name"], "lost"))
+                if verbose:
+                    print(f"[settler] pick {pid}: {p['pick_name']} LOST ({detail})")
+            elif status == "void":
+                tracker.settle_pick(pid, "void")
+                voided += 1
+                if verbose:
+                    print(f"[settler] pick {pid}: VOID ({detail})")
+            elif status == "error":
+                errors += 1
+                if verbose:
+                    print(f"[settler] pick {pid}: error ({detail})")
+            else:
+                skipped += 1
+                if verbose:
+                    print(f"[settler] pick {pid}: {detail}")
 
-        winner, loser = result
-
-        if _name_match(p["pick_name"], winner):
-            tracker.settle_pick(p["id"], "won")
-            settled += 1
-            results.append((p["id"], p["pick_name"], "won"))
-            if verbose:
-                print(f"[settler] pick {p['id']}: {p['pick_name']} WON")
-        elif _name_match(p["pick_name"], loser):
-            tracker.settle_pick(p["id"], "lost")
-            settled += 1
-            results.append((p["id"], p["pick_name"], "lost"))
-            if verbose:
-                print(f"[settler] pick {p['id']}: {p['pick_name']} LOST")
-        else:
-            skipped += 1
-            if verbose:
-                print(f"[settler] pick {p['id']}: no name match — "
-                      f"pick={p['pick_name']}, result={winner}/{loser}")
-
-        # Rate limit between fetches
-        if i < len(picks) - 1:
-            time.sleep(FETCH_DELAY)
+    elapsed = time.time() - t0
+    if verbose:
+        print(f"[settler] done in {elapsed:.1f}s · "
+              f"settled={settled} voided={voided} skipped={skipped} errors={errors}")
 
     return {
         "checked": len(picks),
         "settled": settled,
         "skipped": skipped,
         "errors": errors,
+        "voided": voided,
         "results": results,
+        "elapsed": elapsed,
     }

@@ -1,0 +1,578 @@
+import os
+import math
+import json
+import sqlite3
+from datetime import datetime, timezone
+from flask import Flask, render_template_string, request
+import requests
+
+app = Flask(__name__)
+
+SURFACES = {"hard", "clay", "grass"}
+player_cache = {}
+fixtures_cache = None
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "odds.db")
+
+# ---------- Bzzoiro config (corrected base URL) ----------
+BZZOIRO_BASE = os.environ.get("BZZOIRO_BASE",
+                              "https://sports.bzzoiro.com/tennis/api/v2")
+BZZOIRO_TOKEN = os.environ.get("BZZOIRO_API_KEY")
+
+
+def bzzoiro_get(endpoint, params=None):
+    if not BZZOIRO_TOKEN:
+        raise RuntimeError("BZZOIRO_API_KEY not set in environment.")
+    headers = {"Authorization": f"Token {BZZOIRO_TOKEN}",
+               "Accept": "application/json"}
+    url = f"{BZZOIRO_BASE}{endpoint}"
+    r = requests.get(url, headers=headers, params=params, timeout=20)
+    if r.status_code == 401:
+        raise RuntimeError("Bzzoiro 401: bad or missing token. "
+                           "Send Authorization: Token <key>[reference:2].")
+    if r.status_code == 402:
+        raise RuntimeError("Bzzoiro 402: Sports Addon not active. "
+                           "Tennis API requires the $5/mo Sports Addon[reference:3].")
+    if r.status_code == 404:
+        raise RuntimeError(f"Bzzoiro 404: endpoint not found. "
+                           f"Check that the base URL includes /tennis/api/v2/. URL was: {url}")
+    r.raise_for_status()
+    return r.json()
+
+
+# ---------- SQLite ----------
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA user_version = 2")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS odds (
+            match_id INTEGER PRIMARY KEY,
+            mw1 REAL, mw2 REAL,
+            s11 REAL, s12 REAL,
+            line REAL, ov REAL, un REAL,
+            updated_at TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def ensure_schema():
+    if not os.path.exists(DB_PATH):
+        init_db()
+        return
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.execute("PRAGMA user_version")
+    if cur.fetchone()[0] < 2:
+        conn.execute("DROP TABLE IF EXISTS odds")
+        conn.commit()
+    conn.close()
+    init_db()
+
+
+def save_odds(match_id, **v):
+    cols = ["match_id", "mw1", "mw2", "s11", "s12", "line", "ov", "un", "updated_at"]
+    vals = [match_id, v.get("mw1"), v.get("mw2"), v.get("s11"), v.get("s12"),
+            v.get("line"), v.get("ov"), v.get("un"),
+            datetime.now(timezone.utc).isoformat()]
+    placeholders = ",".join("?" * len(cols))
+    updates = ",".join(f"{c}=excluded.{c}" for c in cols if c != "match_id")
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        f"INSERT INTO odds ({','.join(cols)}) VALUES ({placeholders}) "
+        f"ON CONFLICT(match_id) DO UPDATE SET {updates}", vals)
+    conn.commit()
+    conn.close()
+
+
+def load_all_odds():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("SELECT * FROM odds").fetchall()
+    conn.close()
+    return {r["match_id"]: dict(r) for r in rows}
+
+
+# ---------- Model ----------
+def safe(d, *keys, default=None):
+    cur = d
+    for k in keys:
+        if not isinstance(cur, dict):
+            return default
+        cur = cur.get(k)
+        if cur is None:
+            return default
+    return cur
+
+
+def elo_prob(e1, e2):
+    return 1 / (1 + 10 ** ((e2 - e1) / 400))
+
+
+def player_name(p):
+    return (p.get("full_name") or p.get("name")
+            or f"{p.get('first_name','')} {p.get('last_name','')}".strip()
+            or "Unknown")
+
+
+def player_rank(p):
+    # Bzzoiro player detail exposes ranking under several possible keys
+    return (safe(p, "current_ranking", "position")
+            or safe(p, "current_ranking", "rank")
+            or p.get("rank")
+            or safe(p, "ranking", "position")
+            or 500)
+
+
+def player_points(p):
+    return (safe(p, "current_ranking", "points")
+            or p.get("ranking_points")
+            or safe(p, "ranking", "points")
+            or 0)
+
+
+def player_rating(p):
+    """Bzzoiro exposes ranking points; map to an Elo-like scale."""
+    elo = p.get("elo") or safe(p, "stats", "elo", "overall")
+    if elo:
+        return float(elo)
+    pts = player_points(p)
+    # Scale: ~10,000 ATP pts ≈ 1750 Elo. Tune after seeing real data.
+    return 1500 + float(pts) / 40.0
+
+
+def total_games_model(elo_diff):
+    ad = abs(elo_diff)
+    p_3sets = 0.4 * math.exp(-ad / 200)
+    closeness = max(0.0, 1 - ad / 400)
+    base_2set = 19 + 4 * closeness
+    base_3set = 29 + 3 * closeness
+    return (1 - p_3sets) * base_2set + p_3sets * base_3set, p_3sets
+
+
+def norm_cdf(x, mu, sigma):
+    return 0.5 * (1 + math.erf((x - mu) / (sigma * math.sqrt(2))))
+
+
+def over_prob(line, expected, sigma=3.5):
+    return 1 - norm_cdf(line, expected, sigma)
+
+
+def fair_odds(p):
+    p = max(0.02, min(0.98, p))
+    return round(1 / p, 2)
+
+
+def predict(p1, p2, surface):
+    r1, r2 = player_rating(p1), player_rating(p2)
+    p_elo = elo_prob(r1, r2)
+
+    # Placeholder until H2H endpoint is wired in
+    f1, f2 = 0.5, 0.5
+    p_form = 0.5
+
+    rk1, rk2 = player_rank(p1), player_rank(p2)
+    p_rank = rk2 / (rk1 + rk2) if (rk1 + rk2) else 0.5
+
+    p_set1 = 0.5 * p_elo + 0.5 * p_rank  # placeholder blend
+
+    prob = 0.55 * p_elo + 0.20 * p_form + 0.15 * p_rank + 0.10 * p_set1
+    exp_games, p3 = total_games_model(r1 - r2)
+
+    return {
+        "prob": prob, "p_elo": p_elo, "p_form": p_form,
+        "p_rank": p_rank, "p_set1": p_set1,
+        "e1": r1, "e2": r2, "f1": f1, "f2": f2,
+        "exp_games": exp_games, "p_3sets": p3,
+    }
+
+
+# ---------- Bzzoiro data loading ----------
+def normalize_fixture(m):
+    """
+    Bzzoiro match list schema (from explorer):
+      { id, match_date, player1: {...}, player2: {...},
+        round_name, tournament: {...}, status, ... }[reference:4]
+    """
+    t = m.get("tournament") or {}
+    if isinstance(t, dict):
+        tour_name = t.get("name") or "Unknown"
+        surface = (t.get("surface") or "hard").lower()
+    else:
+        tour_name = str(t)
+        surface = "hard"
+    if surface not in SURFACES:
+        surface = "hard"
+
+    p1 = m.get("player1") or {}
+    p2 = m.get("player2") or {}
+
+    return {
+        "id": m.get("id"),
+        "tournament": tour_name,
+        "round": m.get("round_name") or m.get("round") or "",
+        "surface": surface,
+        "start_time": m.get("match_date") or "",
+        "p1_raw": p1,
+        "p2_raw": p2,
+        "p1_id": p1.get("id") if isinstance(p1, dict) else None,
+        "p2_id": p2.get("id") if isinstance(p2, dict) else None,
+    }
+
+
+def load_matches():
+    global fixtures_cache
+    if fixtures_cache is not None:
+        return fixtures_cache
+
+    try:
+        data = bzzoiro_get("/matches/", params={"circuit": "ATP", "limit": 100})
+    except Exception as e:
+        print(f"Bzzoiro fetch error: {e}")
+        fixtures_cache = []
+        return []
+
+    raw_list = data.get("results") if isinstance(data, dict) else data
+    if not isinstance(raw_list, list):
+        raw_list = []
+
+    out = []
+    for m in raw_list:
+        try:
+            fx = normalize_fixture(m)
+            if not fx["p1_id"] or not fx["p2_id"]:
+                continue
+            # Skip doubles by name (Bzzoiro may return team-style names with "/")
+            n1 = player_name(fx["p1_raw"])
+            n2 = player_name(fx["p2_raw"])
+            if "/" in n1 or "/" in n2:
+                continue
+
+            if fx["p1_id"] not in player_cache:
+                player_cache[fx["p1_id"]] = bzzoiro_get(f"/players/{fx['p1_id']}/")
+            if fx["p2_id"] not in player_cache:
+                player_cache[fx["p2_id"]] = bzzoiro_get(f"/players/{fx['p2_id']}/")
+
+            p1 = player_cache[fx["p1_id"]] or fx["p1_raw"]
+            p2 = player_cache[fx["p2_id"]] or fx["p2_raw"]
+
+            pred = predict(p1, p2, fx["surface"])
+            out.append({
+                "match": {"id": fx["id"], "tournament": fx["tournament"],
+                          "round": fx["round"], "surface": fx["surface"]},
+                "p1": {"name": player_name(p1), "ranking": player_rank(p1)},
+                "p2": {"name": player_name(p2), "ranking": player_rank(p2)},
+                "surface": fx["surface"],
+                "pred": pred,
+            })
+        except Exception as e:
+            print(f"Skipping match {m.get('id')}: {e}")
+            continue
+
+    fixtures_cache = out
+    return out
+
+
+# ---------- Template (unchanged from working version) ----------
+PAGE = """
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tennis Betting Model</title>
+<style>
+  :root{
+    --bg0:#0a0d1a;--bg2:#1a1f36;
+    --fg:#e8eaf2;--dim:#8892b0;--dim2:#b8c0dc;
+    --line:rgba(255,255,255,0.08);--line2:rgba(255,255,255,0.04);
+    --p1:#7fd4ff;--p1b:#4fa3ff;
+    --p2:#a78bfa;--p2b:#8b5cf6;
+    --hit:#6ee7b7;--hitbg:rgba(52,211,153,0.13);
+    --miss:#94a3b8;--missbg:rgba(148,163,184,0.07);
+    --neg:#f87171;--negbg:rgba(248,113,113,0.11);
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:-apple-system,"Segoe UI",Roboto,sans-serif;
+    background:radial-gradient(circle at top,var(--bg2) 0%,var(--bg0) 60%);
+    color:var(--fg);min-height:100vh;padding:26px 14px 60px;
+    -webkit-font-smoothing:antialiased}
+  .wrap{max-width:680px;margin:0 auto}
+  h1{font-size:23px;letter-spacing:-0.4px;
+    background:linear-gradient(90deg,var(--p1),var(--p2));
+    -webkit-background-clip:text;-webkit-text-fill-color:transparent}
+  .sub{color:var(--dim);font-size:12.5px;margin-top:4px}
+  .legend{color:#4a5270;font-size:11px;margin:6px 0 20px}
+  .legend b{color:var(--dim);font-weight:600}
+  .card{background:linear-gradient(180deg,rgba(255,255,255,0.045),rgba(255,255,255,0.012));
+    border:1px solid var(--line);border-radius:18px;margin-bottom:14px;overflow:hidden}
+  .card-head{padding:16px 18px 14px;border-bottom:1px solid var(--line2)}
+  .tourney{font-size:10.5px;letter-spacing:1.4px;text-transform:uppercase;
+    color:var(--p1);font-weight:700;margin-bottom:10px;
+    display:flex;align-items:center;gap:8px}
+  .tourney .dot{width:5px;height:5px;border-radius:50%;background:var(--p1)}
+  .matchup{display:grid;grid-template-columns:1fr auto 1fr;gap:10px;align-items:center}
+  .side{min-width:0}.side.right{text-align:right}
+  .pname{font-size:15.5px;font-weight:600;letter-spacing:-0.2px;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .pmeta{font-size:11px;color:var(--dim);margin-top:3px;font-variant-numeric:tabular-nums}
+  .pmeta b{color:var(--dim2);font-weight:600}
+  .vs-div{color:#3a4160;font-size:10px;font-weight:800;letter-spacing:1px}
+  .pbar{display:flex;height:4px;border-radius:3px;overflow:hidden;
+    margin-top:10px;background:rgba(255,255,255,0.05)}
+  .pbar .a{background:linear-gradient(90deg,var(--p1),var(--p1b))}
+  .pbar .b{background:linear-gradient(90deg,var(--p2),var(--p2b))}
+  .market{padding:12px 18px 14px;border-bottom:1px solid var(--line2)}
+  .market:last-of-type{border-bottom:none}
+  .mkt-title{display:flex;justify-content:space-between;align-items:center;
+    font-size:10.5px;letter-spacing:1.4px;text-transform:uppercase;
+    color:var(--dim);font-weight:700;margin-bottom:8px;gap:8px}
+  .mkt-title .left{display:flex;align-items:center;gap:8px;min-width:0}
+  .mkt-title .hint{color:#4a5270;letter-spacing:0;text-transform:none;
+    font-weight:500;font-size:11px;white-space:nowrap}
+  .mrow{display:grid;grid-template-columns:minmax(0,1fr) 52px 68px 62px;
+    align-items:center;gap:8px;padding:5px 0}
+  .mrow + .mrow{border-top:1px dashed var(--line2)}
+  .label{display:flex;align-items:center;gap:7px;min-width:0}
+  .swatch{width:3px;height:14px;border-radius:2px;flex-shrink:0}
+  .swatch.p1{background:linear-gradient(180deg,var(--p1),var(--p1b))}
+  .swatch.p2{background:linear-gradient(180deg,var(--p2),var(--p2b))}
+  .swatch.n{background:linear-gradient(180deg,#64748b,#475569)}
+  .lbl-text{font-size:13px;color:var(--fg);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .prob{font-size:12.5px;font-weight:700;text-align:right;font-variant-numeric:tabular-nums}
+  input.odds{width:100%;background:rgba(255,255,255,0.05);
+    border:1px solid var(--line);color:var(--fg);padding:6px 8px;
+    border-radius:7px;font-size:12.5px;font-variant-numeric:tabular-nums;
+    text-align:right;font-family:inherit;transition:border-color .15s,background .15s}
+  input.odds:focus{outline:none;border-color:rgba(127,212,255,0.55);
+    background:rgba(127,212,255,0.07)}
+  input.odds.default{color:#94a3b8;font-style:italic}
+  input.odds.line{width:52px;padding:3px 6px;font-size:11.5px;
+    display:inline-block;margin-left:6px;text-transform:none;
+    letter-spacing:0;color:var(--fg);font-style:normal}
+  .edge{font-size:11.5px;font-weight:700;text-align:right;
+    padding:4px 7px;border-radius:6px;font-variant-numeric:tabular-nums;
+    border:1px solid transparent}
+  .edge.hit{color:var(--hit);background:var(--hitbg);border-color:rgba(52,211,153,0.3)}
+  .edge.miss{color:var(--miss);background:var(--missbg)}
+  .edge.neg{color:var(--neg);background:var(--negbg)}
+  .card-foot{padding:12px 18px 16px;background:rgba(0,0,0,0.15);
+    border-top:1px solid var(--line2)}
+  .breakdown{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:12px}
+  .bd{font-size:10px;color:var(--dim);text-align:center;letter-spacing:0.4px}
+  .bd b{display:block;color:var(--dim2);font-size:12.5px;font-weight:700;
+    margin-top:2px;font-variant-numeric:tabular-nums}
+  button.submit{width:100%;background:linear-gradient(90deg,var(--p1),var(--p2));
+    border:none;color:#0a0d1a;font-weight:800;padding:11px;border-radius:10px;
+    cursor:pointer;font-size:13px;letter-spacing:0.3px;transition:transform .1s}
+  button.submit:active{transform:scale(0.985)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>🎾 Tennis Betting Model</h1>
+  <p class="sub">{{ matches|length }} ATP matches · odds inline per market · edges auto-checked</p>
+  <p class="legend">Grey italic odds = <b>model fair price</b> · type bookmaker odds to see the edge</p>
+
+  {% if matches|length == 0 %}
+    <div class="card"><div class="card-head">
+      <div class="tourney"><span class="dot"></span>No matches loaded</div>
+      <p style="font-size:13px;color:#b8c0dc;line-height:1.5">
+        Bzzoiro returned no parseable fixtures. Visit
+        <a href="/debug" style="color:#7fd4ff">/debug</a> to see the raw response.
+      </p>
+    </div></div>
+  {% endif %}
+
+  {% for m in matches %}
+    {% set s = odds_map.get(m.match.id, {}) %}
+    {% set mw1 = s.get('mw1') if s.get('mw1') else m.pred.fair_mw1 %}
+    {% set mw2 = s.get('mw2') if s.get('mw2') else m.pred.fair_mw2 %}
+    {% set s11 = s.get('s11') if s.get('s11') else m.pred.fair_s11 %}
+    {% set s12 = s.get('s12') if s.get('s12') else m.pred.fair_s12 %}
+    {% set line = s.get('line') if s.get('line') else m.pred.fair_line %}
+    {% set ov = s.get('ov') if s.get('ov') else m.pred.fair_ov %}
+    {% set un = s.get('un') if s.get('un') else m.pred.fair_un %}
+    {% set is_default = not (s.get('mw1')) %}
+
+    {% set p1p = m.pred.prob %}
+    {% set p2p = 1 - p1p %}
+    {% set s1p1 = m.pred.p_set1 %}
+    {% set s1p2 = 1 - s1p1 %}
+    {% set pov = m.pred.p_over %}
+    {% set pun = 1 - pov %}
+
+    {% set e_mw1 = p1p - (1/mw1) %}
+    {% set e_mw2 = p2p - (1/mw2) %}
+    {% set e_s11 = s1p1 - (1/s11) %}
+    {% set e_s12 = s1p2 - (1/s12) %}
+    {% set e_ov  = pov - (1/ov) %}
+    {% set e_un  = pun - (1/un) %}
+
+    <div class="card">
+      <div class="card-head">
+        <div class="tourney"><span class="dot"></span>{{ m.match.tournament }} · {{ m.surface|title }} · {{ m.match.round }}</div>
+        <div class="matchup">
+          <div class="side">
+            <div class="pname">{{ m.p1.name }}</div>
+            <div class="pmeta">Rank <b>#{{ m.p1.ranking }}</b> · Rating <b>{{ '%.0f'|format(m.pred.e1) }}</b></div>
+          </div>
+          <div class="vs-div">VS</div>
+          <div class="side right">
+            <div class="pname">{{ m.p2.name }}</div>
+            <div class="pmeta">Rank <b>#{{ m.p2.ranking }}</b> · Rating <b>{{ '%.0f'|format(m.pred.e2) }}</b></div>
+          </div>
+        </div>
+        <div class="pbar">
+          <div class="a" style="width: {{ p1p*100 }}%"></div>
+          <div class="b" style="width: {{ p2p*100 }}%"></div>
+        </div>
+      </div>
+
+      <form method="post" action="/check/{{ m.match.id }}">
+        <div class="market">
+          <div class="mkt-title"><span>Match Winner</span>
+            <span class="hint">{{ '%.1f'|format(p1p*100) }} / {{ '%.1f'|format(p2p*100) }}</span></div>
+          <div class="mrow">
+            <div class="label"><span class="swatch p1"></span><span class="lbl-text">{{ m.p1.name }}</span></div>
+            <div class="prob">{{ '%.1f'|format(p1p*100) }}%</div>
+            <input class="odds {{ 'default' if is_default }}" name="mw1" value="{{ mw1 }}" inputmode="decimal">
+            <div class="edge {{ 'hit' if e_mw1>0.03 else ('neg' if e_mw1<-0.03 else 'miss') }}">{{ '%+.1f'|format(e_mw1*100) }}%</div>
+          </div>
+          <div class="mrow">
+            <div class="label"><span class="swatch p2"></span><span class="lbl-text">{{ m.p2.name }}</span></div>
+            <div class="prob">{{ '%.1f'|format(p2p*100) }}%</div>
+            <input class="odds {{ 'default' if is_default }}" name="mw2" value="{{ mw2 }}" inputmode="decimal">
+            <div class="edge {{ 'hit' if e_mw2>0.03 else ('neg' if e_mw2<-0.03 else 'miss') }}">{{ '%+.1f'|format(e_mw2*100) }}%</div>
+          </div>
+        </div>
+
+        <div class="market">
+          <div class="mkt-title"><span>Set 1 Winner</span>
+            <span class="hint">{{ '%.1f'|format(s1p1*100) }} / {{ '%.1f'|format(s1p2*100) }}</span></div>
+          <div class="mrow">
+            <div class="label"><span class="swatch p1"></span><span class="lbl-text">{{ m.p1.name }}</span></div>
+            <div class="prob">{{ '%.1f'|format(s1p1*100) }}%</div>
+            <input class="odds {{ 'default' if is_default }}" name="s11" value="{{ s11 }}" inputmode="decimal">
+            <div class="edge {{ 'hit' if e_s11>0.03 else ('neg' if e_s11<-0.03 else 'miss') }}">{{ '%+.1f'|format(e_s11*100) }}%</div>
+          </div>
+          <div class="mrow">
+            <div class="label"><span class="swatch p2"></span><span class="lbl-text">{{ m.p2.name }}</span></div>
+            <div class="prob">{{ '%.1f'|format(s1p2*100) }}%</div>
+            <input class="odds {{ 'default' if is_default }}" name="s12" value="{{ s12 }}" inputmode="decimal">
+            <div class="edge {{ 'hit' if e_s12>0.03 else ('neg' if e_s12<-0.03 else 'miss') }}">{{ '%+.1f'|format(e_s12*100) }}%</div>
+          </div>
+        </div>
+
+        <div class="market">
+          <div class="mkt-title">
+            <span class="left">Total Games · line <input class="odds line" name="line" value="{{ line }}" inputmode="decimal"></span>
+            <span class="hint">exp {{ '%.1f'|format(m.pred.exp_games) }} · 3-set {{ '%.0f'|format(m.pred.p_3sets*100) }}%</span>
+          </div>
+          <div class="mrow">
+            <div class="label"><span class="swatch n"></span><span class="lbl-text">Over</span></div>
+            <div class="prob">{{ '%.1f'|format(pov*100) }}%</div>
+            <input class="odds {{ 'default' if is_default }}" name="ov" value="{{ ov }}" inputmode="decimal">
+            <div class="edge {{ 'hit' if e_ov>0.03 else ('neg' if e_ov<-0.03 else 'miss') }}">{{ '%+.1f'|format(e_ov*100) }}%</div>
+          </div>
+          <div class="mrow">
+            <div class="label"><span class="swatch n"></span><span class="lbl-text">Under</span></div>
+            <div class="prob">{{ '%.1f'|format(pun*100) }}%</div>
+            <input class="odds {{ 'default' if is_default }}" name="un" value="{{ un }}" inputmode="decimal">
+            <div class="edge {{ 'hit' if e_un>0.03 else ('neg' if e_un<-0.03 else 'miss') }}">{{ '%+.1f'|format(e_un*100) }}%</div>
+          </div>
+        </div>
+
+        <div class="card-foot">
+          <div class="breakdown">
+            <div class="bd">RATING<b>{{ '%.0f'|format(m.pred.p_elo*100) }}%</b></div>
+            <div class="bd">Form<b>{{ '%.0f'|format(m.pred.p_form*100) }}%</b></div>
+            <div class="bd">Rank<b>{{ '%.0f'|format(m.pred.p_rank*100) }}%</b></div>
+            <div class="bd">Set 1<b>{{ '%.0f'|format(m.pred.p_set1*100) }}%</b></div>
+          </div>
+          <button class="submit" type="submit">Save odds &amp; recompute edges</button>
+        </div>
+      </form>
+    </div>
+  {% endfor %}
+</div>
+</body>
+</html>
+"""
+
+
+# ---------- Routes ----------
+def build_matches_with_markets():
+    matches = load_matches()
+    saved_all = load_all_odds()
+    for m in matches:
+        saved = saved_all.get(m["match"]["id"], {})
+        line = saved.get("line") or math.floor(m["pred"]["exp_games"]) + 0.5
+        m["pred"]["p_over"] = over_prob(line, m["pred"]["exp_games"])
+        m["pred"]["line_used"] = line
+        p = m["pred"]
+        p["fair_mw1"] = fair_odds(p["prob"])
+        p["fair_mw2"] = fair_odds(1 - p["prob"])
+        p["fair_s11"] = fair_odds(p["p_set1"])
+        p["fair_s12"] = fair_odds(1 - p["p_set1"])
+        p["fair_ov"] = fair_odds(p["p_over"])
+        p["fair_un"] = fair_odds(1 - p["p_over"])
+        p["fair_line"] = round(line * 2) / 2
+    return matches
+
+
+@app.route("/")
+def index():
+    try:
+        matches = build_matches_with_markets()
+    except Exception as e:
+        return f"<pre style='color:#f87171;padding:24px'>Error: {e}</pre>", 500
+    return render_template_string(PAGE, matches=matches, odds_map=load_all_odds())
+
+
+@app.route("/debug")
+def debug():
+    out = {"base_url": BZZOIRO_BASE, "token_set": bool(BZZOIRO_TOKEN)}
+    try:
+        raw = bzzoiro_get("/matches/", params={"circuit": "ATP", "limit": 5})
+        out["matches_response_type"] = type(raw).__name__
+        sample = raw.get("results") if isinstance(raw, dict) else raw
+        out["count"] = raw.get("count") if isinstance(raw, dict) else None
+        out["matches_sample"] = (sample or [])[:2]
+        if sample:
+            first_id = sample[0].get("id")
+            if first_id:
+                out["match_detail_sample"] = bzzoiro_get(f"/matches/{first_id}/")
+                out["h2h_sample"] = bzzoiro_get(f"/matches/{first_id}/h2h/")
+            p1 = (sample[0].get("player1") or {})
+            pid = p1.get("id") if isinstance(p1, dict) else None
+            if pid:
+                out["player_sample"] = bzzoiro_get(f"/players/{pid}/")
+    except Exception as e:
+        out["error"] = str(e)
+    return ("<pre style='color:#e8eaf2;background:#0a0d1a;padding:20px;"
+            "white-space:pre-wrap;word-break:break-word;font-size:12px'>"
+            f"{json.dumps(out, indent=2, default=str)}</pre>")
+
+
+@app.route("/check/<int:match_id>", methods=["POST"])
+def check(match_id):
+    def num(name, default):
+        try:
+            return float(request.form.get(name, default) or default)
+        except ValueError:
+            return default
+
+    save_odds(match_id,
+              mw1=num("mw1", 1.80), mw2=num("mw2", 2.00),
+              s11=num("s11", 1.90), s12=num("s12", 1.90),
+              line=num("line", 22.5),
+              ov=num("ov", 1.90), un=num("un", 1.90))
+
+    matches = build_matches_with_markets()
+    return render_template_string(PAGE, matches=matches, odds_map=load_all_odds())
+
+
+if __name__ == "__main__":
+    ensure_schema()
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)

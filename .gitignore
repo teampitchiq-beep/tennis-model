@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Cached scraped data
+data/
+rankings.json
+form.json
+odds_cache.json
+elo_ratings.json
+
+# Logs
+*.log
+logs/
+
+# Secrets
+.env
+*.key
+secrets.txt
+
+# OS
+.DS_Store
+Thumbs.db

@@ -8,6 +8,8 @@ from datetime import date
 import requests
 from bs4 import BeautifulSoup
 
+import surfaces
+
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
       "AppleWebKit/537.36 (KHTML, like Gecko) "
       "Chrome/121.0.0.0 Safari/537.36")
@@ -280,22 +282,64 @@ def save_form(cache):
 
 
 # =================== TENNISEXPLORER MATCHES ===================
-def _parse_te_page(html):
+def head_info(tr):
+    """Parse a tournament header row -> (name, tour, is_doubles).
+
+    Normal headers carry a link (/<slug>/<year>/atp-men/). The aggregate
+    "Futures <year>" header has no link at all (all ITF men's matches are
+    listed under it), so fall back to the cell text and the type-men/women icon.
+    """
+    td = tr.find("td", class_="t-name")
+    if td is None:
+        return None
+    a = td.find("a")
+    name = (a.get_text(strip=True) if a else td.get_text(strip=True)) or "Tennis"
+    href = a.get("href", "") if a else ""
+    if "wta-women" in href:
+        tour = "wta"
+    elif "atp-men" in href:
+        tour = "atp"
+    elif td.find("span", class_=re.compile(r"type-men")):
+        tour = "atp"
+    elif td.find("span", class_=re.compile(r"type-women")):
+        tour = "wta"
+    else:
+        tour = None
+    doubles = "type=double" in href or bool(
+        tr.find("span", class_=re.compile(r"type-(men|women)4")))
+    return name, tour, doubles
+
+
+def _parse_te_page(html, month=None):
+    """Parse a TennisExplorer day page into singles matches.
+
+    Tournament headers are `<tr class="head ..."><td class="t-name"><a href=
+    "/<slug>/<year>/atp-men/">Name</a>`. The previous parser looked for a
+    /tournament/ link on a row WITHOUT t-name, which never matched, so every
+    match was labelled "Tennis". The header also tells us the tour
+    (atp-men / wta-women), which is needed to resolve player names.
+    """
     soup = BeautifulSoup(html, "lxml")
     matches = []
     seen = set()
-    current_tournament = "Tennis"
 
     for table in soup.find_all("table", class_="result"):
         rows = table.find_all("tr")
+        current_tournament = "Tennis"
+        current_tour = None
+        skip_block = False
         i = 0
         while i < len(rows):
             tr = rows[i]
-            tour_link = tr.find("a", href=re.compile(r"/tournament/"))
-            if tour_link and not tr.find("td", class_="t-name"):
-                txt = tour_link.get_text(strip=True)
-                if txt:
-                    current_tournament = txt
+
+            if "head" in (tr.get("class") or []):
+                info = head_info(tr)
+                if info:
+                    current_tournament, current_tour, skip_block = info
+                i += 1
+                continue
+
+            if skip_block:
                 i += 1
                 continue
 
@@ -345,11 +389,15 @@ def _parse_te_page(html):
             time_td = tr.find("td", class_="time")
             time_str = time_td.get_text(strip=True) if time_td else ""
 
+            surface = surfaces.guess(current_tournament, month) or "unknown"
+
             matches.append({
                 "id": f"te_{_stable_id('te', n1, n2, current_tournament)}",
                 "source": "tennisexplorer",
                 "tournament": current_tournament,
-                "surface": "hard", "round": "", "status": time_str,
+                "tour": current_tour,
+                "level": surfaces.level_from_name(current_tournament),
+                "surface": surface.lower(), "round": "", "status": time_str,
                 "p1_name": n1, "p2_name": n2,
                 "p1_rank": None, "p2_rank": None,
                 "p1_url": a1.get("href", ""),
@@ -366,7 +414,7 @@ def from_tennisexplorer(target_date=None):
     print(f"[tennisexplorer] fetching {url}")
     html = _get(url)
     print(f"[tennisexplorer] {len(html)} bytes")
-    parsed = _parse_te_page(html)
+    parsed = _parse_te_page(html, month=d.month)
     names = sorted({m["tournament"] for m in parsed})
     print(f"[tennisexplorer] tournaments: {names[:8]}{'...' if len(names) > 8 else ''}")
     return parsed

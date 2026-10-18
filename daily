@@ -1,28 +1,37 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Runs every day at 6:00 AM GMT+3
-cd ~/tennis_model
+cd ~/tennis_model || exit 1
 
-# Log everything
 LOG=~/tennis_model/logs/refresh_$(date +%Y%m%d).log
 mkdir -p ~/tennis_model/logs
-
 echo "=== Refresh started at $(date) ===" >> "$LOG"
+
+# Secrets live in ~/tennis_model/.env (git-ignored), never in this script:
+#   LIVETENNISAPI_KEY=...
+if [ -f .env ]; then set -a; . ./.env; set +a; fi
 
 # 1. Clear caches that expire daily
 rm -f rankings.json
 
-# 2. Refresh Elo dataset (only new months — preserves existing files)
-export LIVETENNISAPI_KEY=twjp_1278d845735622c3f5d02bb076dbff95
+# 2. Refresh the archive (current-year files re-download from upstream first),
+#    then pull every finished match since the archive ends, so Elo is current.
+#    (Ratings 4.5 months stale cost ~0.027 log loss in backtests.)
 python -c "
 import dataset
-matches = dataset.load_all_matches()
-print(f'Loaded {len(matches)} matches')
+m = dataset.load_all_matches()
+print(f'Loaded {len(m)} matches, newest {m[-1][\"_date\"].date()}')
 " >> "$LOG" 2>&1
+python recent.py >> "$LOG" 2>&1
 
-# 3. Refresh form cache (clears stale form data)
+# 3. Weekly (Sunday): re-evaluate on held-out data and refit the blend weights
+if [ "$(date +%u)" = "7" ]; then
+  python evaluate.py >> "$LOG" 2>&1
+fi
+
+# 4. Refresh form cache (display only)
 rm -f form.json
 
-# 4. Restart the Flask app if it's running
+# 5. Restart the Flask app
 pkill -f "python app.py" 2>/dev/null
 sleep 2
 nohup python app.py >> "$LOG" 2>&1 &

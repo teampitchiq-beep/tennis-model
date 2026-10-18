@@ -1,9 +1,9 @@
 """
-Automatic settlement of open MW picks.
+Automatic settlement of open MW picks (tracker).
 
-- Skips non-MW picks (legacy Sets) — auto-voids them
-- Auto-voids picks older than STALE_DAYS (unsettleable)
-- Fetches in parallel (4 workers) to avoid blocking startup
+- Settles open picks (won/lost/void)
+- When a result is determined, also stores it in results.db
+  for future cross-reference (H2H, historical accuracy, etc.)
 """
 import re
 import time
@@ -14,6 +14,7 @@ import requests
 from bs4 import BeautifulSoup
 
 import tracker
+import results
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
       "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -25,7 +26,6 @@ HEADER_RE = re.compile(
 
 FETCH_WORKERS = 4
 FETCH_TIMEOUT = 15
-
 STALE_DAYS = 5
 
 
@@ -59,7 +59,6 @@ def _fetch_te_match(te_id):
 
 
 def _parse_result(soup):
-    """Return (winner_name, loser_name) if finished, else None."""
     table = soup.find("table", class_="result")
     if not table:
         return None
@@ -87,11 +86,33 @@ def _parse_result(soup):
             continue
 
         if sets_a > sets_b:
-            return (name_a, name_b)
+            return {"winner": name_a, "loser": name_b,
+                    "score": score, "sets_a": sets_a, "sets_b": sets_b}
         elif sets_b > sets_a:
-            return (name_b, name_a)
+            return {"winner": name_b, "loser": name_a,
+                    "score": score, "sets_a": sets_b, "sets_b": sets_a}
 
     return None
+
+
+def _extract_meta(soup):
+    meta = {"tournament": "", "round": "", "surface": "", "date": ""}
+    try:
+        title = soup.find("title")
+        if title:
+            meta["tournament"] = title.get_text(strip=True)[:80]
+
+        tour_link = soup.find("a", href=re.compile(r"/tournament/"))
+        if tour_link:
+            meta["tournament"] = tour_link.get_text(strip=True)
+
+        date_m = re.search(r"(\d{2})\.(\d{2})\.(\d{4})",
+                           soup.get_text(" ", strip=True)[:2000])
+        if date_m:
+            meta["date"] = f"{date_m.group(3)}-{date_m.group(2)}-{date_m.group(1)}"
+    except Exception:
+        pass
+    return meta
 
 
 def _age_days(pick):
@@ -109,49 +130,65 @@ def _age_days(pick):
 
 
 def _process_pick(p):
-    """
-    Returns a tuple: (pick_id, status, detail)
-    status: 'won' | 'lost' | 'void' | 'skip' | 'error'
-    """
     market = (p.get("market") or "mw").lower()
     if market != "mw":
-        return (p["id"], "void", "legacy non-MW pick")
+        return (p["id"], "void", "legacy non-MW pick", None)
 
     if _age_days(p) > STALE_DAYS:
-        return (p["id"], "void", f"stale (>{STALE_DAYS}d old)")
+        return (p["id"], "void", f"stale (>{STALE_DAYS}d old)", None)
 
     te_id = p.get("te_match_id")
     if not te_id:
-        return (p["id"], "skip", "no te_match_id")
+        return (p["id"], "skip", "no te_match_id", None)
 
     soup = _fetch_te_match(te_id)
     if soup is None:
-        return (p["id"], "error", "fetch failed")
+        return (p["id"], "error", "fetch failed", None)
 
     result = _parse_result(soup)
     if not result:
-        return (p["id"], "skip", "match not finished")
+        return (p["id"], "skip", "match not finished", None)
 
-    winner, loser = result
+    winner = result["winner"]
+    loser = result["loser"]
+    score = result["score"]
+
+    meta = _extract_meta(soup)
+    event_date = meta.get("date") or ""
+
+    result_dict = {
+        "te_match_id": te_id,
+        "event_date": event_date,
+        "tournament": p.get("tournament") or meta.get("tournament") or "",
+        "round_": meta.get("round", ""),
+        "surface": p.get("surface") or meta.get("surface") or "",
+        "p1_name": p.get("pick_name", ""),
+        "p2_name": p.get("opponent_name", ""),
+        "winner_name": winner,
+        "loser_name": loser,
+        "score": score,
+    }
 
     if _name_match(p["pick_name"], winner):
-        return (p["id"], "won", f"beat {loser}")
+        return (p["id"], "won", f"beat {loser}", result_dict)
     if _name_match(p["pick_name"], loser):
-        return (p["id"], "lost", f"lost to {winner}")
-    return (p["id"], "skip", f"no name match (winner={winner})")
+        return (p["id"], "lost", f"lost to {winner}", result_dict)
+    return (p["id"], "skip", f"no name match (winner={winner})", result_dict)
 
 
 def settle_open_picks(verbose=True):
     picks = tracker.list_picks(status="open")
     if not picks:
         return {"checked": 0, "settled": 0, "skipped": 0,
-                "errors": 0, "voided": 0, "results": [], "elapsed": 0.0}
+                "errors": 0, "voided": 0, "results_logged": 0,
+                "results": [], "elapsed": 0.0}
 
     settled = 0
     skipped = 0
     errors = 0
     voided = 0
-    results = []
+    results_logged = 0
+    results_summary = []
 
     t0 = time.time()
 
@@ -160,20 +197,37 @@ def settle_open_picks(verbose=True):
         for f in as_completed(futures):
             p = futures[f]
             try:
-                pid, status, detail = f.result()
+                pid, status, detail, result_dict = f.result()
             except Exception as e:
-                pid, status, detail = p["id"], "error", str(e)
+                pid, status, detail, result_dict = p["id"], "error", str(e), None
+
+            if result_dict:
+                rid = results.add_result(
+                    te_match_id=result_dict["te_match_id"],
+                    event_date=result_dict["event_date"],
+                    tournament=result_dict["tournament"],
+                    round_=result_dict["round_"],
+                    surface=result_dict["surface"],
+                    p1_name=result_dict["p1_name"],
+                    p2_name=result_dict["p2_name"],
+                    winner_name=result_dict["winner_name"],
+                    loser_name=result_dict["loser_name"],
+                    score=result_dict["score"],
+                    source="settler",
+                )
+                if rid:
+                    results_logged += 1
 
             if status == "won":
                 tracker.settle_pick(pid, "won")
                 settled += 1
-                results.append((pid, p["pick_name"], "won"))
+                results_summary.append((pid, p["pick_name"], "won"))
                 if verbose:
                     print(f"[settler] pick {pid}: {p['pick_name']} WON ({detail})")
             elif status == "lost":
                 tracker.settle_pick(pid, "lost")
                 settled += 1
-                results.append((pid, p["pick_name"], "lost"))
+                results_summary.append((pid, p["pick_name"], "lost"))
                 if verbose:
                     print(f"[settler] pick {pid}: {p['pick_name']} LOST ({detail})")
             elif status == "void":
@@ -193,7 +247,9 @@ def settle_open_picks(verbose=True):
     elapsed = time.time() - t0
     if verbose:
         print(f"[settler] done in {elapsed:.1f}s · "
-              f"settled={settled} voided={voided} skipped={skipped} errors={errors}")
+              f"settled={settled} voided={voided} "
+              f"skipped={skipped} errors={errors} "
+              f"results_logged={results_logged}")
 
     return {
         "checked": len(picks),
@@ -201,6 +257,7 @@ def settle_open_picks(verbose=True):
         "skipped": skipped,
         "errors": errors,
         "voided": voided,
-        "results": results,
+        "results_logged": results_logged,
+        "results": results_summary,
         "elapsed": elapsed,
     }

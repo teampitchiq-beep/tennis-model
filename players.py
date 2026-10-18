@@ -76,6 +76,12 @@ def _surname(last):
 
 
 def build_index():
+    """Index of every known player: key and surname -> [(player_id, tour)].
+
+    Unlike the original (which kept only the lowest player_id per key, i.e.
+    typically an old/retired namesake, and mixed ATP with WTA), all candidates
+    are kept so resolve() can pick the active one on the right tour.
+    """
     global _MEM_INDEX
     if _MEM_INDEX is not None:
         return _MEM_INDEX
@@ -96,24 +102,50 @@ def build_index():
 
             key = _name_key(first, last)
             if key:
-                if key not in by_key or pid < by_key[key]:
-                    by_key[key] = pid
+                by_key.setdefault(key, []).append((pid, tour))
 
             sn = _surname(last)
             if sn:
-                by_surname.setdefault(sn, []).append(pid)
+                by_surname.setdefault(sn, []).append((pid, tour))
 
     print(f"[players] index: {len(by_key)} keys, {len(by_surname)} surnames")
     _MEM_INDEX = {"by_key": by_key, "by_surname": by_surname}
     return _MEM_INDEX
 
 
-def resolve(display_name, index=None):
+def _pick(cands, tour=None, ratings=None):
+    """Choose one player id from [(pid, tour), ...]."""
+    if not cands:
+        return None
+    if tour:
+        same = [c for c in cands if c[1] == tour]
+        if same:
+            cands = same
+    if len(cands) == 1:
+        return cands[0][0]
+    if ratings:
+        def activity(c):
+            e = ratings.get(c[0])
+            if e is None:
+                return ("", -1)
+            return (e.get("last", ""), e.get("n", 0))
+        best = max(cands, key=activity)
+        if activity(best)[1] >= 0:
+            return best[0]
+    return min(c[0] for c in cands)
+
+
+def resolve(display_name, index=None, tour=None, ratings=None):
     """
+    Map a display name to a Sackmann player_id.
+
+    tour:    'atp' / 'wta' if known (disambiguates namesakes across tours).
+    ratings: Elo ratings dict {pid: {..., 'last', 'n'}}; among namesakes the
+             most recently active one is chosen.
+
     Examples:
-      'Zverev A.'   -> 20010422
-      'Zverev'      -> 20010422
-      'Rinderknech' -> 20000065
+      'Zverev A.'   -> 100644
+      'Zverev'      -> 100644
     """
     if not display_name:
         return None
@@ -131,8 +163,7 @@ def resolve(display_name, index=None):
         return None
 
     if len(tokens) == 1:
-        pids = by_surname.get(tokens[0], [])
-        return min(pids) if pids else None
+        return _pick(by_surname.get(tokens[0], []), tour, ratings)
 
     initial = tokens[-1][:1] if tokens[-1] else ""
     surname_parts = tokens[:-1]
@@ -141,8 +172,7 @@ def resolve(display_name, index=None):
         surname = "".join(surname_parts[-take:])
         key = f"{surname}_{initial}"
         if key in by_key:
-            return by_key[key]
+            return _pick(by_key[key], tour, ratings)
 
     full_surname = "".join(surname_parts)
-    pids = by_surname.get(full_surname, [])
-    return min(pids) if pids else None
+    return _pick(by_surname.get(full_surname, []), tour, ratings)

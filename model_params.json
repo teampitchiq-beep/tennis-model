@@ -1,0 +1,11 @@
+{
+  "w_elo": 1.9655144152114121,
+  "w_rank": 0.16781808191997893,
+  "w_elo_only": 2.2906433839253593,
+  "w_rank_only": 0.6808307063804153,
+  "min_matches": 3,
+  "trained_through": "2026-06-01",
+  "fit_rows": 57056,
+  "holdout_logloss": 0.61236,
+  "elo_params_version": 3
+}
